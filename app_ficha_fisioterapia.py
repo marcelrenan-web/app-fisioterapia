@@ -1,13 +1,18 @@
 import streamlit as st
-import speech_recognition as sr
+from streamlit_webrtc import webrtc_streamer, AudioProcessorBase
+import av
+import whisper
+import numpy as np
 from datetime import datetime
-import PyPDF2
 
-# Configuração da página
+# Carrega modelo Whisper
+model = whisper.load_model("base")  # Pode usar "tiny" para mais leve
+
+# Página inicial
 st.set_page_config(page_title="Ficha de Atendimento - Fisioterapia", layout="centered")
 st.title("🩺 Ficha de Atendimento - Fisioterapia com IA")
 
-# Função para aplicar correções automáticas
+# Correções de termos comuns
 def corrigir_termos(texto):
     correcoes = {
         "tendinite": "tendinite",
@@ -21,57 +26,48 @@ def corrigir_termos(texto):
         texto = texto.replace(errado, certo)
     return texto
 
-# Estado inicial do texto
-if "texto_extraido" not in st.session_state:
-    st.session_state.texto_extraido = ""
+# Session state para salvar a transcrição
+if "transcricao" not in st.session_state:
+    st.session_state.transcricao = ""
 
-# Gravação de voz
-st.subheader("🎤 Registrar atendimento por voz")
-if st.button("Iniciar gravação"):
-    recognizer = sr.Recognizer()
-    mic = sr.Microphone()
-    with mic as source:
-        st.info("Fale agora...")
-        recognizer.adjust_for_ambient_noise(source)
-        try:
-            audio = recognizer.listen(source, timeout=5)
-            texto = recognizer.recognize_google(audio, language="pt-BR")
-            texto_corrigido = corrigir_termos(texto)
-            st.session_state.texto_extraido = texto_corrigido
-            st.success("Texto reconhecido e corrigido com sucesso!")
-        except sr.UnknownValueError:
-            st.error("Não foi possível reconhecer o que foi dito.")
-        except sr.RequestError:
-            st.error("Erro ao se conectar ao serviço de reconhecimento de voz.")
-        except sr.WaitTimeoutError:
-            st.error("Tempo de escuta excedido. Tente novamente.")
+# Processador de áudio
+class AudioProcessor(AudioProcessorBase):
+    def __init__(self) -> None:
+        self.buffer = b""
 
-# Exibição do texto reconhecido
-if st.session_state.texto_extraido:
-    st.write("📝 Texto reconhecido e corrigido:")
-    st.write(f"> {st.session_state.texto_extraido}")
+    def recv(self, frame: av.AudioFrame) -> av.AudioFrame:
+        pcm = frame.to_ndarray().flatten().astype(np.float32).tobytes()
+        self.buffer += pcm
 
-# Upload de PDF
-st.subheader("📄 Extrair texto de PDF")
-uploaded_file = st.file_uploader("Envie um arquivo PDF com o atendimento", type="pdf")
-if uploaded_file is not None:
-    try:
-        pdf_reader = PyPDF2.PdfReader(uploaded_file)
-        texto_pdf = ""
-        for page in pdf_reader.pages:
-            texto_pdf += page.extract_text()
-        texto_corrigido = corrigir_termos(texto_pdf)
-        st.session_state.texto_extraido = texto_corrigido
-        st.success("Texto extraído e corrigido com sucesso!")
-    except Exception as e:
-        st.error(f"Erro ao processar o PDF: {e}")
+        if len(self.buffer) > 32000 * 5:  # 5 segundos
+            audio_np = np.frombuffer(self.buffer, np.float32)
+            audio_np = whisper.pad_or_trim(audio_np)
+            mel = whisper.log_mel_spectrogram(audio_np).to(model.device)
+            options = whisper.DecodingOptions(language="pt", fp16=False)
+            result = whisper.decode(model, mel, options)
+            st.session_state.transcricao += corrigir_termos(result.text) + " "
+            self.buffer = b""
+        return frame
+
+# Stream do microfone
+st.subheader("🎤 Fale e veja o texto ao vivo:")
+webrtc_streamer(
+    key="microfone",
+    mode="SENDONLY",
+    audio_processor_factory=AudioProcessor,
+    media_stream_constraints={"audio": True, "video": False},
+)
+
+# Exibir transcrição atual
+st.text_area("📝 Texto reconhecido:", st.session_state.transcricao, height=200)
 
 # Formulário da ficha de atendimento
+st.subheader("📋 Preencha os dados do atendimento")
 with st.form("formulario_ficha"):
     nome = st.text_input("Nome do paciente")
     idade = st.number_input("Idade", min_value=0, max_value=120)
     data_atendimento = st.date_input("Data do atendimento", value=datetime.today())
-    sintomas = st.text_area("Relato do paciente (pode colar o texto reconhecido)", value=st.session_state.texto_extraido)
+    sintomas = st.text_area("Relato do paciente", value=st.session_state.transcricao)
     diagnostico = st.text_area("Diagnóstico clínico")
     conduta = st.text_area("Conduta adotada")
     enviado = st.form_submit_button("Salvar ficha")
@@ -87,3 +83,7 @@ with st.form("formulario_ficha"):
         **🩺 Diagnóstico:** {diagnostico}  
         **📝 Conduta:** {conduta}
         """)
+
+ 
+
+ 
